@@ -258,6 +258,10 @@ class CombinedPoint:
 class CombinedResult:
     points: list[CombinedPoint]
     first_elapsed_s: float
+    first_log_elapsed_s: float
+    first_backend_read_seconds: float
+    first_open_archive_scale: float
+    first_raw_backend_reads: int
     first_backend_reads: int
     first_read_ops: int
     second_backend_reads_est: int
@@ -304,26 +308,41 @@ def build_combined_result(
     auto_min_gap_buckets: int,
     auto_min_backend_ms: float,
     second_start_gap_s: float,
+    first_backend_read_seconds: float,
+    first_open_archive_scale: float,
 ) -> CombinedResult:
     first_samples = parse_spinfs_log(first_gamma_log)
-    first_points = [
-        CombinedPoint(
+
+    first_points: list[CombinedPoint] = []
+    for sample in first_samples:
+        if sample.read_ops <= 0:
+            continue
+        corrected_backend_reads = int(
+            round(sample.open_archive_cnt * first_open_archive_scale)
+        )
+        elapsed_s = (
+            corrected_backend_reads * first_backend_read_seconds
+            if first_backend_read_seconds > 0
+            else sample.elapsed_s
+        )
+        first_points.append(
+            CombinedPoint(
             segment="gamma1_spinfs_counter",
-            elapsed_s=sample.elapsed_s,
-            backend_reads_cum=sample.open_archive_cnt,
+            elapsed_s=elapsed_s,
+            backend_reads_cum=corrected_backend_reads,
             read_ops_cum=sample.read_ops,
-            ratio=sample.cumulative_ratio,
+            ratio=corrected_backend_reads / sample.read_ops,
             raw_backend_reads_cum=sample.open_archive_cnt,
             raw_read_ops_cum=sample.read_ops,
         )
-        for sample in first_samples
-        if sample.read_ops > 0
-    ]
+        )
     if not first_points:
         raise ValueError(f"no valid SpinFS samples in {first_gamma_log}")
 
     first_last = first_points[-1]
     first_elapsed_s = first_last.elapsed_s
+    first_log_elapsed_s = first_samples[-1].elapsed_s
+    first_raw_backend_reads = first_last.raw_backend_reads_cum
     first_backend_reads = first_last.backend_reads_cum
     first_read_ops = first_last.read_ops_cum
 
@@ -375,6 +394,10 @@ def build_combined_result(
     return CombinedResult(
         points=points,
         first_elapsed_s=first_elapsed_s,
+        first_log_elapsed_s=first_log_elapsed_s,
+        first_backend_read_seconds=first_backend_read_seconds,
+        first_open_archive_scale=first_open_archive_scale,
+        first_raw_backend_reads=first_raw_backend_reads,
         first_backend_reads=first_backend_reads,
         first_read_ops=first_read_ops,
         second_backend_reads_est=second_backend_reads_est,
@@ -420,8 +443,12 @@ def plot_combined(
         label="第二次 gamma 开始",
     )
 
+    if result.first_backend_read_seconds > 0:
+        time_note = f"，第一次 gamma 按 {result.first_backend_read_seconds:g}s/后端读估算"
+    else:
+        time_note = "，第一次 gamma 使用日志时间"
     ax.set_title("热数据缓存方案：两次 gamma read 拼接结果")
-    ax.set_xlabel(f"连续运行时间（{unit_text}）")
+    ax.set_xlabel(f"连续运行时间（{unit_text}{time_note}）")
     ax.set_ylabel("累计读磁电盘次数 / 累计读操作数")
     ax.set_xlim(left=0)
     ax.set_ylim(-0.03, 1.03)
@@ -478,8 +505,13 @@ def write_summary(
         f"second_gamma_log: {second_gamma_log}",
         "",
         "[gamma1 SpinFS counter]",
-        f"elapsed_s: {result.first_elapsed_s:.3f}",
-        f"spinfs_open_archive_cnt: {result.first_backend_reads}",
+        f"log_elapsed_s: {result.first_log_elapsed_s:.3f}",
+        f"backend_read_seconds: {result.first_backend_read_seconds:.3f}",
+        f"open_archive_scale: {result.first_open_archive_scale:.9f}",
+        f"estimated_elapsed_s: {result.first_elapsed_s:.3f}",
+        f"estimated_elapsed_h: {result.first_elapsed_s / 3600.0:.9f}",
+        f"spinfs_open_archive_cnt_raw: {result.first_raw_backend_reads}",
+        f"spinfs_open_archive_cnt_corrected: {result.first_backend_reads}",
         f"spinfs_read_ops: {result.first_read_ops}",
         f"ratio: {result.first_backend_reads / result.first_read_ops:.9f}",
         "",
@@ -559,6 +591,24 @@ def parse_args(argv: list[str]) -> argparse.Namespace:
         help="Optional gap between gamma1 and gamma2 on the x-axis",
     )
     parser.add_argument(
+        "--first-gamma-backend-read-seconds",
+        type=float,
+        default=360.0,
+        help=(
+            "Estimated seconds consumed by one first-gamma backend archive read. "
+            "Use 0 to keep the SpinFS log timestamp axis."
+        ),
+    )
+    parser.add_argument(
+        "--first-gamma-open-archive-scale",
+        type=float,
+        default=1.0,
+        help=(
+            "Scale applied to first-gamma spinfs_open_archive_cnt before "
+            "combining. Default 1.0 keeps the raw upper-bound counter."
+        ),
+    )
+    parser.add_argument(
         "--miss-threshold-ms",
         type=float,
         default=None,
@@ -590,6 +640,12 @@ def main(argv: list[str]) -> int:
 
     output_dir = args.output_dir.expanduser().resolve()
     output_dir.mkdir(parents=True, exist_ok=True)
+    if args.first_gamma_backend_read_seconds < 0:
+        print("error: --first-gamma-backend-read-seconds must be >= 0", file=sys.stderr)
+        return 2
+    if args.first_gamma_open_archive_scale < 0:
+        print("error: --first-gamma-open-archive-scale must be >= 0", file=sys.stderr)
+        return 2
 
     result = build_combined_result(
         first_gamma_log=first_gamma_log,
@@ -599,6 +655,8 @@ def main(argv: list[str]) -> int:
         auto_min_gap_buckets=args.auto_min_gap_buckets,
         auto_min_backend_ms=args.auto_min_backend_ms,
         second_start_gap_s=args.second_start_gap_s,
+        first_backend_read_seconds=args.first_gamma_backend_read_seconds,
+        first_open_archive_scale=args.first_gamma_open_archive_scale,
     )
 
     x_unit = choose_x_unit(result) if args.x_unit == "auto" else args.x_unit
@@ -614,6 +672,11 @@ def main(argv: list[str]) -> int:
     print(f"plot = {plot_path}")
     print(f"csv = {csv_path}")
     print(f"summary = {summary_path}")
+    print(f"gamma1_backend_read_seconds = {result.first_backend_read_seconds:.3f}")
+    print(f"gamma1_open_archive_scale = {result.first_open_archive_scale:.9f}")
+    print(f"gamma1_log_elapsed_s = {result.first_log_elapsed_s:.3f}")
+    print(f"gamma1_estimated_elapsed_s = {result.first_elapsed_s:.3f}")
+    print(f"gamma1_raw_open_archive_cnt = {result.first_raw_backend_reads}")
     print(f"gamma1_read_ops = {result.first_read_ops}")
     print(f"gamma1_backend_reads = {result.first_backend_reads}")
     print(f"gamma2_rd_ops = {result.second_read_ops}")

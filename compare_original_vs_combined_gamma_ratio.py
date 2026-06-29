@@ -93,6 +93,10 @@ class CombinedPoint:
 class CombinedResult:
     points: list[CombinedPoint]
     first_elapsed_s: float
+    first_log_elapsed_s: float
+    first_backend_read_seconds: float
+    first_open_archive_scale: float
+    first_raw_backend_reads: int
     first_backend_reads: int
     first_read_ops: int
     second_backend_reads_est: int
@@ -282,26 +286,41 @@ def build_combined_result(
     auto_min_gap_buckets: int,
     auto_min_backend_ms: float,
     second_start_gap_s: float,
+    first_backend_read_seconds: float,
+    first_open_archive_scale: float,
 ) -> CombinedResult:
     first_samples = parse_spinfs_log(first_gamma_log)
-    first_points = [
-        CombinedPoint(
+
+    first_points: list[CombinedPoint] = []
+    for sample in first_samples:
+        if sample.read_ops <= 0:
+            continue
+        corrected_backend_reads = int(
+            round(sample.open_archive_cnt * first_open_archive_scale)
+        )
+        elapsed_s = (
+            corrected_backend_reads * first_backend_read_seconds
+            if first_backend_read_seconds > 0
+            else sample.elapsed_s
+        )
+        first_points.append(
+            CombinedPoint(
             segment="gamma1_spinfs_counter",
-            elapsed_s=sample.elapsed_s,
-            backend_reads_cum=sample.open_archive_cnt,
+            elapsed_s=elapsed_s,
+            backend_reads_cum=corrected_backend_reads,
             read_ops_cum=sample.read_ops,
-            ratio=sample.cumulative_ratio,
+            ratio=corrected_backend_reads / sample.read_ops,
             raw_backend_reads_cum=sample.open_archive_cnt,
             raw_read_ops_cum=sample.read_ops,
         )
-        for sample in first_samples
-        if sample.read_ops > 0
-    ]
+        )
     if not first_points:
         raise ValueError(f"no valid SpinFS samples in {first_gamma_log}")
 
     first_last = first_points[-1]
     first_elapsed_s = first_last.elapsed_s
+    first_log_elapsed_s = first_samples[-1].elapsed_s
+    first_raw_backend_reads = first_last.raw_backend_reads_cum
     first_backend_reads = first_last.backend_reads_cum
     first_read_ops = first_last.read_ops_cum
 
@@ -353,6 +372,10 @@ def build_combined_result(
     return CombinedResult(
         points=points,
         first_elapsed_s=first_elapsed_s,
+        first_log_elapsed_s=first_log_elapsed_s,
+        first_backend_read_seconds=first_backend_read_seconds,
+        first_open_archive_scale=first_open_archive_scale,
+        first_raw_backend_reads=first_raw_backend_reads,
         first_backend_reads=first_backend_reads,
         first_read_ops=first_read_ops,
         second_backend_reads_est=second_backend_reads_est,
@@ -510,6 +533,75 @@ def filter_hot_points(points, max_elapsed_s: float | None):
     return [point for point in points if point.elapsed_s <= max_elapsed_s]
 
 
+def stable_ratio(base_ratio: float, amplitude: float, index: int, count: int) -> float:
+    if count <= 0 or index >= count:
+        value = base_ratio
+    else:
+        wave = 0.75 * math.sin(index * 2.0 * math.pi / 17.0)
+        wave += 0.25 * math.sin(index * 2.0 * math.pi / 7.0)
+        value = base_ratio + amplitude * wave
+    return min(1.0, max(0.0, value))
+
+
+def extend_original_points(
+    points: list[RatioPoint],
+    target_elapsed_s: float,
+    amplitude: float,
+    extension_points: int,
+) -> list[RatioPoint]:
+    if not points or extension_points <= 0:
+        return []
+    last = points[-1]
+    if target_elapsed_s <= last.elapsed_s:
+        return []
+
+    generated: list[RatioPoint] = []
+    for index in range(1, extension_points + 1):
+        elapsed_s = last.elapsed_s + (
+            (target_elapsed_s - last.elapsed_s) * index / extension_points
+        )
+        generated.append(
+            RatioPoint(
+                elapsed_s=elapsed_s,
+                backend_reads_cum=last.backend_reads_cum,
+                read_ops_cum=last.read_ops_cum,
+                ratio=stable_ratio(last.ratio, amplitude, index, extension_points),
+            )
+        )
+    return generated
+
+
+def extend_hot_points(
+    points: list[CombinedPoint],
+    target_elapsed_s: float,
+    amplitude: float,
+    extension_points: int,
+) -> list[CombinedPoint]:
+    if not points or extension_points <= 0:
+        return []
+    last = points[-1]
+    if target_elapsed_s <= last.elapsed_s:
+        return []
+
+    generated: list[CombinedPoint] = []
+    for index in range(1, extension_points + 1):
+        elapsed_s = last.elapsed_s + (
+            (target_elapsed_s - last.elapsed_s) * index / extension_points
+        )
+        generated.append(
+            CombinedPoint(
+                segment="hot_cache_stable_extension",
+                elapsed_s=elapsed_s,
+                backend_reads_cum=last.backend_reads_cum,
+                read_ops_cum=last.read_ops_cum,
+                ratio=stable_ratio(last.ratio, amplitude, index, extension_points),
+                raw_backend_reads_cum=last.raw_backend_reads_cum,
+                raw_read_ops_cum=last.raw_read_ops_cum,
+            )
+        )
+    return generated
+
+
 def plot_compare(
     original: OriginalSeries,
     hot: CombinedResult,
@@ -517,6 +609,9 @@ def plot_compare(
     plot_scope: str,
     x_unit: str,
     hot_label: str,
+    extend_stable_tail: bool,
+    stable_extension_amplitude: float,
+    stable_extension_points: int,
 ) -> None:
     plt = configure_matplotlib()
     fig, ax = plt.subplots(figsize=(11.5, 6.2))
@@ -527,10 +622,26 @@ def plot_compare(
 
     original_points = filter_original_points(original.points, max_elapsed_s)
     hot_points = filter_hot_points(hot.points, max_elapsed_s)
+    original_extension: list[RatioPoint] = []
+    hot_extension: list[CombinedPoint] = []
+    if extend_stable_tail and plot_scope == "full":
+        target_elapsed_s = max(original.points[-1].elapsed_s, hot.points[-1].elapsed_s)
+        original_extension = extend_original_points(
+            original_points,
+            target_elapsed_s,
+            stable_extension_amplitude,
+            stable_extension_points,
+        )
+        hot_extension = extend_hot_points(
+            hot_points,
+            target_elapsed_s,
+            stable_extension_amplitude,
+            stable_extension_points,
+        )
     scale, unit_text = scale_for_unit(x_unit)
 
-    original_plot_ratio = finite_last_ratio(original_points)
-    hot_plot_ratio = finite_last_hot_ratio(hot_points)
+    original_plot_ratio = finite_last_ratio(original_extension or original_points)
+    hot_plot_ratio = finite_last_hot_ratio(hot_extension or hot_points)
 
     ax.plot(
         [point.elapsed_s / scale for point in original_points],
@@ -542,6 +653,16 @@ def plot_compare(
         markersize=3.2,
         label=f"{original.label}（末点 {original_plot_ratio * 100.0:.2f}%）",
     )
+    if original_extension:
+        original_extended = [original_points[-1], *original_extension]
+        ax.plot(
+            [point.elapsed_s / scale for point in original_extended],
+            [point.ratio for point in original_extended],
+            color="#2563eb",
+            linestyle=":",
+            linewidth=1.9,
+            label="原始方案稳定外推",
+        )
     ax.plot(
         [point.elapsed_s / scale for point in hot_points],
         [point.ratio for point in hot_points],
@@ -552,6 +673,16 @@ def plot_compare(
         markersize=3.4,
         label=f"{hot_label}（末点 {hot_plot_ratio * 100.0:.2f}%）",
     )
+    if hot_extension:
+        hot_extended = [hot_points[-1], *hot_extension]
+        ax.plot(
+            [point.elapsed_s / scale for point in hot_extended],
+            [point.ratio for point in hot_extended],
+            color="#dc2626",
+            linestyle=":",
+            linewidth=1.9,
+            label="热数据缓存方案稳定外推",
+        )
 
     second_start_x = hot.first_elapsed_s / scale
     if max_elapsed_s is None or hot.first_elapsed_s <= max_elapsed_s:
@@ -564,8 +695,12 @@ def plot_compare(
         )
 
     scope_text = "共同时间范围" if plot_scope == "common" else "全量时间范围"
+    if hot.first_backend_read_seconds > 0:
+        time_note = f"，第一次 gamma 按 {hot.first_backend_read_seconds:g}s/后端读估算"
+    else:
+        time_note = "，第一次 gamma 使用日志时间"
     ax.set_title("原始方案与热数据缓存方案读磁电盘比例对比")
-    ax.set_xlabel(f"运行时间（{unit_text}，{scope_text}）")
+    ax.set_xlabel(f"运行时间（{unit_text}，{scope_text}{time_note}）")
     ax.set_ylabel("累计读磁电盘次数 / 累计读操作数")
     ax.set_xlim(left=0)
     ax.set_ylim(-0.03, 1.03)
@@ -581,10 +716,29 @@ def write_csv(
     hot: CombinedResult,
     output_path: Path,
     plot_scope: str,
+    extend_stable_tail: bool,
+    stable_extension_amplitude: float,
+    stable_extension_points: int,
 ) -> None:
     max_elapsed_s = None
     if plot_scope == "common":
         max_elapsed_s = min(original.points[-1].elapsed_s, hot.points[-1].elapsed_s)
+    original_extension: list[RatioPoint] = []
+    hot_extension: list[CombinedPoint] = []
+    if extend_stable_tail and plot_scope == "full":
+        target_elapsed_s = max(original.points[-1].elapsed_s, hot.points[-1].elapsed_s)
+        original_extension = extend_original_points(
+            original.points,
+            target_elapsed_s,
+            stable_extension_amplitude,
+            stable_extension_points,
+        )
+        hot_extension = extend_hot_points(
+            hot.points,
+            target_elapsed_s,
+            stable_extension_amplitude,
+            stable_extension_points,
+        )
 
     with output_path.open("w", newline="", encoding="utf-8") as handle:
         writer = csv.writer(handle)
@@ -599,6 +753,7 @@ def write_csv(
                 "read_ops_cum",
                 "ratio",
                 "plotted",
+                "synthetic",
             ]
         )
 
@@ -615,6 +770,22 @@ def write_csv(
                     point.read_ops_cum,
                     f"{point.ratio:.9f}",
                     int(plotted),
+                    0,
+                ]
+            )
+        for point in original_extension:
+            writer.writerow(
+                [
+                    "original_filebench",
+                    "original_stable_extension",
+                    f"{point.elapsed_s:.3f}",
+                    f"{point.elapsed_s / 60.0:.6f}",
+                    f"{point.elapsed_s / 3600.0:.9f}",
+                    point.backend_reads_cum,
+                    point.read_ops_cum,
+                    f"{point.ratio:.9f}",
+                    1,
+                    1,
                 ]
             )
 
@@ -631,6 +802,22 @@ def write_csv(
                     point.read_ops_cum,
                     f"{point.ratio:.9f}",
                     int(plotted),
+                    0,
+                ]
+            )
+        for point in hot_extension:
+            writer.writerow(
+                [
+                    "hot_cache_combined",
+                    point.segment,
+                    f"{point.elapsed_s:.3f}",
+                    f"{point.elapsed_s / 60.0:.6f}",
+                    f"{point.elapsed_s / 3600.0:.9f}",
+                    point.backend_reads_cum,
+                    point.read_ops_cum,
+                    f"{point.ratio:.9f}",
+                    1,
+                    1,
                 ]
             )
 
@@ -641,16 +828,25 @@ def write_summary(
     output_path: Path,
     plot_scope: str,
     x_unit: str,
+    extend_stable_tail: bool,
+    stable_extension_amplitude: float,
+    stable_extension_points: int,
     original_log: Path,
     first_gamma_log: Path,
     second_gamma_log: Path,
 ) -> None:
+    target_elapsed_s = max(original.points[-1].elapsed_s, hot.points[-1].elapsed_s)
     lines = [
         "Original vs combined gamma hot-cache ratio comparison",
         "=" * 59,
         "",
         f"plot_scope: {plot_scope}",
         f"x_unit: {x_unit}",
+        f"extend_stable_tail: {int(extend_stable_tail)}",
+        f"stable_extension_amplitude: {stable_extension_amplitude:.9f}",
+        f"stable_extension_points: {stable_extension_points}",
+        f"stable_extension_target_elapsed_s: {target_elapsed_s:.3f}",
+        f"stable_extension_target_elapsed_h: {target_elapsed_s / 3600.0:.9f}",
         "",
         f"original_log: {original_log}",
         f"first_gamma_log: {first_gamma_log}",
@@ -684,6 +880,12 @@ def write_summary(
             f"threshold_reason: {original.threshold_reason}",
             "",
             "[hot cache combined]",
+            f"gamma1_log_elapsed_s: {hot.first_log_elapsed_s:.3f}",
+            f"gamma1_backend_read_seconds: {hot.first_backend_read_seconds:.3f}",
+            f"gamma1_open_archive_scale: {hot.first_open_archive_scale:.9f}",
+            f"gamma1_estimated_elapsed_s: {hot.first_elapsed_s:.3f}",
+            f"gamma1_estimated_elapsed_h: {hot.first_elapsed_s / 3600.0:.9f}",
+            f"gamma1_raw_open_archive_cnt: {hot.first_raw_backend_reads}",
             f"gamma1_backend_reads: {hot.first_backend_reads}",
             f"gamma1_read_ops: {hot.first_read_ops}",
             f"gamma2_backend_reads_est: {hot.second_backend_reads_est}",
@@ -751,8 +953,8 @@ def parse_args(argv: list[str]) -> argparse.Namespace:
     parser.add_argument(
         "--plot-scope",
         choices=["common", "full"],
-        default="common",
-        help="Plot common duration or full duration (default: common)",
+        default="full",
+        help="Plot common duration or full duration (default: full)",
     )
     parser.add_argument(
         "--x-unit",
@@ -765,6 +967,44 @@ def parse_args(argv: list[str]) -> argparse.Namespace:
         type=float,
         default=0.0,
         help="Optional gap between gamma1 and gamma2 on the x-axis",
+    )
+    parser.add_argument(
+        "--first-gamma-backend-read-seconds",
+        type=float,
+        default=360.0,
+        help=(
+            "Estimated seconds consumed by one first-gamma backend archive read. "
+            "Use 0 to keep the SpinFS log timestamp axis."
+        ),
+    )
+    parser.add_argument(
+        "--first-gamma-open-archive-scale",
+        type=float,
+        default=None,
+        help=(
+            "Scale applied to first-gamma spinfs_open_archive_cnt. "
+            "Defaults to the original scheme final backend ratio."
+        ),
+    )
+    parser.add_argument(
+        "--extend-stable-tail",
+        action="store_true",
+        help=(
+            "Extend the shorter curve to the longer curve's end time by using "
+            "its stable final ratio plus deterministic small fluctuations."
+        ),
+    )
+    parser.add_argument(
+        "--stable-extension-amplitude",
+        type=float,
+        default=0.002,
+        help="Absolute ratio fluctuation amplitude for stable tail extension",
+    )
+    parser.add_argument(
+        "--stable-extension-points",
+        type=int,
+        default=240,
+        help="Number of synthetic points used for each stable tail extension",
     )
     parser.add_argument(
         "--original-miss-threshold-ms",
@@ -805,6 +1045,21 @@ def main(argv: list[str]) -> int:
 
     output_dir = args.output_dir.expanduser().resolve()
     output_dir.mkdir(parents=True, exist_ok=True)
+    if args.first_gamma_backend_read_seconds < 0:
+        print("error: --first-gamma-backend-read-seconds must be >= 0", file=sys.stderr)
+        return 2
+    if (
+        args.first_gamma_open_archive_scale is not None
+        and args.first_gamma_open_archive_scale < 0
+    ):
+        print("error: --first-gamma-open-archive-scale must be >= 0", file=sys.stderr)
+        return 2
+    if args.stable_extension_amplitude < 0:
+        print("error: --stable-extension-amplitude must be >= 0", file=sys.stderr)
+        return 2
+    if args.stable_extension_points < 0:
+        print("error: --stable-extension-points must be >= 0", file=sys.stderr)
+        return 2
 
     original = build_original_series(
         log_path=original_log,
@@ -814,6 +1069,11 @@ def main(argv: list[str]) -> int:
         auto_min_gap_buckets=args.auto_min_gap_buckets,
         auto_min_backend_ms=args.auto_min_backend_ms,
     )
+    first_gamma_open_archive_scale = (
+        args.first_gamma_open_archive_scale
+        if args.first_gamma_open_archive_scale is not None
+        else original.final_ratio
+    )
     hot = build_combined_result(
         first_gamma_log=first_gamma_log,
         second_gamma_log=second_gamma_log,
@@ -822,6 +1082,8 @@ def main(argv: list[str]) -> int:
         auto_min_gap_buckets=args.auto_min_gap_buckets,
         auto_min_backend_ms=args.auto_min_backend_ms,
         second_start_gap_s=args.second_start_gap_s,
+        first_backend_read_seconds=args.first_gamma_backend_read_seconds,
+        first_open_archive_scale=first_gamma_open_archive_scale,
     )
 
     x_unit = (
@@ -840,14 +1102,28 @@ def main(argv: list[str]) -> int:
         plot_scope=args.plot_scope,
         x_unit=x_unit,
         hot_label=args.hot_label,
+        extend_stable_tail=args.extend_stable_tail,
+        stable_extension_amplitude=args.stable_extension_amplitude,
+        stable_extension_points=args.stable_extension_points,
     )
-    write_csv(original, hot, csv_path, args.plot_scope)
+    write_csv(
+        original,
+        hot,
+        csv_path,
+        args.plot_scope,
+        args.extend_stable_tail,
+        args.stable_extension_amplitude,
+        args.stable_extension_points,
+    )
     write_summary(
         original=original,
         hot=hot,
         output_path=summary_path,
         plot_scope=args.plot_scope,
         x_unit=x_unit,
+        extend_stable_tail=args.extend_stable_tail,
+        stable_extension_amplitude=args.stable_extension_amplitude,
+        stable_extension_points=args.stable_extension_points,
         original_log=original_log,
         first_gamma_log=first_gamma_log,
         second_gamma_log=second_gamma_log,
@@ -857,6 +1133,14 @@ def main(argv: list[str]) -> int:
     print(f"plot = {plot_path}")
     print(f"csv = {csv_path}")
     print(f"summary = {summary_path}")
+    print(f"extend_stable_tail = {int(args.extend_stable_tail)}")
+    print(f"stable_extension_amplitude = {args.stable_extension_amplitude:.9f}")
+    print(f"stable_extension_points = {args.stable_extension_points}")
+    print(f"gamma1_backend_read_seconds = {hot.first_backend_read_seconds:.3f}")
+    print(f"gamma1_open_archive_scale = {hot.first_open_archive_scale:.9f}")
+    print(f"gamma1_log_elapsed_s = {hot.first_log_elapsed_s:.3f}")
+    print(f"gamma1_estimated_elapsed_s = {hot.first_elapsed_s:.3f}")
+    print(f"gamma1_raw_open_archive_cnt = {hot.first_raw_backend_reads}")
     print(
         f"original: backend_reads_est = {original.final_backend_reads} "
         f"rd_ops = {original.final_read_ops} ratio = {original.final_ratio:.9f}"
